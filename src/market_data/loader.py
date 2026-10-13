@@ -80,39 +80,53 @@ class MarketDataLoader:
         """
         Récupère la dernière courbe des taux US Treasury disponible sur FRED.
         Retourne une Pandas Series avec Index=Maturité (années) et Value=Taux (%).
+
+        Notes
+        -----
+        - La dernière date renvoyée par FRED peut contenir des NaN (weekend/jour férié/retard de publication).
+          On utilise donc la dernière observation *non vide* et on applique un forward-fill pour stabiliser la courbe.
+        - La courbe est mise en cache dans l'instance pour éviter des requêtes répétées.
         """
         if self._yield_curve_cache is not None:
-             return self._yield_curve_cache
+            return self._yield_curve_cache
 
         try:
-            # On cherche sur les 10 derniers jours pour être sûr de trouver une date de publication (jours ouvrés)
-            start_date = datetime.datetime.now() - datetime.timedelta(days=10)
+            # Fenêtre un peu plus large pour être robuste aux jours non ouvrés et aux retards de publication
+            start_date = datetime.datetime.now() - datetime.timedelta(days=30)
             end_date = datetime.datetime.now()
-            
-            # Récupération via pandas_datareader
-            df = web.DataReader(list(self.fred_tickers.keys()), 'fred', start_date, end_date)
-            
-            # On prend la dernière ligne valide (la plus récente)
-            latest_rates = df.iloc[-1].dropna()
-            
-            if latest_rates.empty:
-                 raise ValueError("Aucune donnée récupérée de FRED.")
 
-            # Construction de la courbe propre : Maturité -> Taux
+            df = web.DataReader(list(self.fred_tickers.keys()), 'fred', start_date, end_date)
+            if df is None or df.empty:
+                raise ValueError('DataFrame vide : vérifiez la connexion ou la disponibilité FRED.')
+
+            df = df.sort_index()
+
+            # On garde uniquement les dates qui contiennent au moins un taux
+            df_valid = df.dropna(how='all')
+            if df_valid.empty:
+                raise ValueError('Aucune donnée récupérée de FRED sur la fenêtre demandée.')
+
+            # On propage la dernière valeur connue pour éviter une dernière ligne entièrement NaN
+            df_ffill = df_valid.ffill()
+            latest_rates = df_ffill.iloc[-1].dropna()
+            if latest_rates.empty:
+                raise ValueError('Aucune donnée exploitable dans la dernière observation FRED.')
+
             curve_data = {}
             for ticker, maturity in self.fred_tickers.items():
-                if ticker in latest_rates:
-                    curve_data[maturity] = latest_rates[ticker]
-            
-            # Conversion en Series triée par maturité
+                v = latest_rates.get(ticker, np.nan)
+                if pd.notna(v):
+                    curve_data[maturity] = float(v)
+
             curve_series = pd.Series(curve_data).sort_index()
-            
+            if len(curve_series) < 2:
+                raise ValueError('Courbe des taux incomplète (moins de 2 points).')
+
             self._yield_curve_cache = curve_series
             return curve_series
 
         except Exception as e:
-            print(f" Erreur lors de la récupération FRED : {e}")
-            
+            raise ValueError(f'Erreur lors de la récupération FRED : {e}')
 
     def get_risk_free_rate_from_curve(self, maturity: float) -> float:
         """

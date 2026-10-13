@@ -230,14 +230,39 @@ class BarrierPricingModel:
             finally:
                 _set_maturity(T0)
             theta = (V_shorter - V0) / dtT
+            
+        # Scale for UI (more interpretable)
+        vega_1pct = vega * 0.01          # €/ +1 vol point
+        rho_1bp   = rho  * 1e-4          # €/ +1 bp
+        rho_1pct  = rho  * 0.01          # €/ +1% rate
+
+        # If you want "theta per day" (NOT annualized), don't divide:
+        # here theta_raw is dV/dT (per year). Convert to per day:
+        theta_per_day = None if theta is None else theta / 365.25
 
         return {
             "Price": V0,
             "Delta": float(delta),
             "Gamma": float(gamma),
-            "Vega": float(vega),
-            "Theta": None if theta is None else float(theta),
-            "Rho": float(rho),
+
+            # --- UI-friendly aliases (units matter!) ---
+            # Vega:   €/ +1% vol  ("1 vol point")
+            # Rho:    €/ +1 bp    (0.01% rate)
+            # Theta:  €/ day
+            "Vega": float(vega_1pct),
+            "Rho": float(rho_1bp),
+            "Theta": None if theta_per_day is None else float(theta_per_day),
+
+            # raw derivatives
+            "Vega_raw": float(vega),
+            "Rho_raw": float(rho),
+            "Theta_raw": None if theta is None else float(theta),
+
+            # scaled for display
+            "Vega_1pct": float(vega_1pct),
+            "Rho_1bp": float(rho_1bp),
+            "Rho_1pct": float(rho_1pct),
+            "Theta_per_day": None if theta_per_day is None else float(theta_per_day),
         }
 
 

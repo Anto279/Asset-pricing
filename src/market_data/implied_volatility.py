@@ -38,24 +38,65 @@ class ImpliedVolatility:
         self.option.parameters.volatility = original_vol
         return None
 
-    def dichotomie(self, lower_bound=1e-5, upper_bound=5.0, tol=1e-5, max_iter=100):
-        """Calcule la volatilité implicite via la méthode de dichotomie."""
-        original_vol = self.option.parameters.get_volatility()
-        for i in range(max_iter):
-            mid_vol = (lower_bound + upper_bound) / 2
-            self.option.parameters.volatility = mid_vol
-            price_mid = self.model.price_option(self.option)
+    def dichotomie(self, lower_bound=1e-5, upper_bound=5.0, tol=1e-5, max_iter=200):
+        """Calcule la volatilité implicite via la méthode de dichotomie.
 
-            if abs(price_mid - self.market_price) < tol:
+        Version robuste :
+        - Vérifie/élargit l'intervalle si besoin (bracketing)
+        - S'arrête aussi si l'intervalle sur sigma devient très petit
+        """
+        original_vol = self.option.parameters.get_volatility()
+
+        market = float(self.market_price)
+
+        try:
+            # Price at lower bound
+            self.option.parameters.volatility = float(lower_bound)
+            p_low = float(self.model.price_option(self.option))
+
+            # Expand upper bound until price_high >= market (or cap)
+            ub = float(upper_bound)
+            self.option.parameters.volatility = ub
+            p_high = float(self.model.price_option(self.option))
+
+            cap = 10.0
+            while p_high < market and ub < cap:
+                ub *= 2.0
+                self.option.parameters.volatility = ub
+                p_high = float(self.model.price_option(self.option))
+
+            # If still not bracketed, no solution under this model/inputs
+            if market < p_low - tol or p_high + tol < market:
                 self.option.parameters.volatility = original_vol
-                return mid_vol
-            
-            if price_mid < self.market_price:
-                lower_bound = mid_vol
-            else:
-                upper_bound = mid_vol
-        
-        self.option.parameters.volatility = original_vol
+                return None
+
+            lower_bound = float(lower_bound)
+            upper_bound = float(ub)
+
+            for _ in range(max_iter):
+                mid_vol = (lower_bound + upper_bound) / 2.0
+                self.option.parameters.volatility = mid_vol
+                price_mid = float(self.model.price_option(self.option))
+
+                if abs(price_mid - market) < tol:
+                    self.option.parameters.volatility = original_vol
+                    return mid_vol
+
+                # Standard bisection update
+                if price_mid < market:
+                    lower_bound = mid_vol
+                else:
+                    upper_bound = mid_vol
+
+                # If sigma interval is tiny, stop
+                if (upper_bound - lower_bound) < 1e-10:
+                    self.option.parameters.volatility = original_vol
+                    return (lower_bound + upper_bound) / 2.0
+
+        finally:
+            # Always restore
+            self.option.parameters.volatility = original_vol
+
         return None
 
     # On utilise une méthode statique car get_surface() car elle implique de créer plusieurs instances d'option 

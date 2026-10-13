@@ -100,6 +100,73 @@ def get_loader():
 
 DATA_LOADER = get_loader()
 
+# =========================================================
+# Helpers (cache + proxy) for option market data
+# =========================================================
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _spot_cached(ticker: str) -> float:
+    return float(DATA_LOADER.get_equity_spot(ticker))
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _expirations_cached(ticker: str) -> list:
+    return list(DATA_LOADER.get_option_expirations(ticker))
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _chain_cached(ticker: str, expiration: str):
+    return DATA_LOADER.get_option_chain_data(ticker, expiration)
+
+
+# =========================================================
+# Helpers (cache) for risk-free rate curve (FRED)
+# =========================================================
+
+@st.cache_data(ttl=24*3600, show_spinner=False)
+def _yield_curve_cached():
+    """Cache la courbe des taux US Treasury (FRED) pendant 24 h."""
+    return DATA_LOADER.get_us_treasury_curve()
+
+
+def rf_from_curve(maturity_years: float) -> float:
+    """Taux sans risque interpolé (décimal) à partir de la courbe FRED."""
+    curve = _yield_curve_cached()
+    maturities = curve.index.to_numpy(dtype=float)
+    rates = curve.to_numpy(dtype=float)
+    return float(np.interp(float(maturity_years), maturities, rates)) / 100.0
+
+# Yahoo Finance often doesn't provide option chains for indices (e.g. ^GSPC).
+# We fall back to liquid ETF proxies when needed.
+_OPTIONS_PROXY = {
+    "^GSPC": "SPY",
+    "^DJI": "DIA",
+    "^IXIC": "QQQ",
+}
+
+def resolve_ticker_for_options(ticker: str):
+    """Return (pricing_ticker, expirations, used_proxy)."""
+    ticker = str(ticker).strip()
+    expirations = _expirations_cached(ticker)
+    if expirations:
+        return ticker, expirations, False
+
+    proxy = _OPTIONS_PROXY.get(ticker)
+    if proxy:
+        exp2 = _expirations_cached(proxy)
+        return proxy, exp2, True
+
+    return ticker, [], False
+
+def nearest_expiration_index(expirations, target_T_years: float) -> int:
+    """Pick the expiration closest to today + target_T_years."""
+    if not expirations:
+        return 0
+    target = pd.Timestamp.today().normalize() + pd.Timedelta(days=int(max(float(target_T_years), 0.0) * 365))
+    dts = pd.to_datetime(pd.Series(expirations), errors="coerce")
+    if dts.isna().all():
+        return 0
+    return int((dts - target).abs().idxmin())
+
+
 EQUITY_TICKERS = [
     # --- INDICES BOURSIERS MONDIAUX (Indices) ---
     "^GSPC (S&P 500)",          # USA - Large Cap
@@ -200,7 +267,7 @@ def page_pricer():
     instrument_type = st.selectbox(
         "Quel instrument voulez-vous pricer ?",
         ["Bond (Obligation)", "Swap de Taux", "Future sur Actions", "Option Vanille sur Actions", "Option Asiatique", "Option Barrière"],
-        index=0 # 'Bond (Obligation)' sélectionné par défaut
+        index=3 # 'Bond (Obligation)' sélectionné par défaut
     )
 
     
@@ -218,7 +285,7 @@ def page_pricer():
     $$
     \text{Valeur} = \sum_{t=1}^{T} C_t + N
     $$
-    où \(C_t\) désigne le coupon et \(N\) le nominal.  
+    où $$C_t$$ désigne le coupon et $$N$$ le nominal.  
     - **Exemple** : nominal \(N = 1000\) €, coupon annuel de 2 % :
     $$
     C = 0.02 \times 1000 = 20 \text{ € par an}
@@ -238,7 +305,7 @@ def page_pricer():
     $$
     \text{Payoff} = S_T - F_0
     $$
-    où \(S_T\) est le prix du sous-jacent à maturité.
+    où $$S_T$$ est le prix du sous-jacent à maturité.
 
     **4) Option vanille (Call / Put)**  
     - **Call** : droit d’acheter le sous-jacent au prix d’exercice \(K\).  
@@ -316,7 +383,7 @@ def page_pricer():
         $$
         - Maturité \(T = 5\) ans.
 
-        Si le taux d’actualisation est \(r \approx 3\%\), la valeur actuelle des flux est **inférieure à 1000 €**, car le coupon offert est relativement faible par rapport au taux du marché.
+        Si le taux d’actualisation est $$r \approx 3\%$$, la valeur actuelle des flux est **inférieure à 1000 €**, car le coupon offert est relativement faible par rapport au taux du marché.
         """)
 
 
@@ -338,7 +405,7 @@ def page_pricer():
         with col4:
             rate_source = st.selectbox("Taux sans Risque (r)", 
                 ["Manuel", "Marché (FRED US Treasury)"],
-                index=1
+                index=0
             )
             
             if rate_source == "Manuel":
@@ -346,7 +413,7 @@ def page_pricer():
             else:
                 # Récupération automatique et interpolation
                 with st.spinner("Récupération de la courbe des taux..."):
-                    risk_free_rate = DATA_LOADER.get_risk_free_rate_from_curve(maturity_years)
+                    risk_free_rate = rf_from_curve(maturity_years)
                 st.success(f"Taux interpolé : **{risk_free_rate*100:.3f} %**")
 
         with col5:
@@ -391,7 +458,7 @@ def page_pricer():
                 # Affichage de la courbe si FRED est sélectionné
                 if rate_source == "Marché (FRED US Treasury)":
                     st.markdown("##### Courbe des taux US Treasury (Interpolation)")
-                    curve_data = DATA_LOADER.get_us_treasury_curve()
+                    curve_data = _yield_curve_cached()
             
                     # Création d'un graphique simple
                     chart_data = pd.DataFrame({"Taux (%)": curve_data})
@@ -444,9 +511,9 @@ def page_pricer():
                 Si les taux d’intérêt augmentent au cours du temps, la valeur de la **jambe variable** augmente, ce qui peut rendre la position **payeur fixe / receveur variable** favorable.
 
                 ### Lecture des indicateurs affichés dans la page
-                - **PV_floating** : valeur actuelle de la jambe variable.
-                - **PV_fixed** : valeur actuelle de la jambe fixe.
-                - **PV_total** :  
+                - **$$PV_{floating}$$** : valeur actuelle de la jambe variable.
+                - **$$PV_{fixed}$$** : valeur actuelle de la jambe fixe.
+                - **$$PV_{total}$$** :  
                 $$
                 \text{PV}_{\text{total}} = \text{PV}_{\text{floating}} - \text{PV}_{\text{fixed}}
                 $$
@@ -471,7 +538,7 @@ def page_pricer():
         with col_s4:
             rate_source = st.selectbox("Taux sans Risque (r)", 
                 ["Manuel", "Marché (FRED US Treasury)"],
-                index=1
+                index=0
             )
 
             list_risk_free_rates = []
@@ -483,9 +550,9 @@ def page_pricer():
             else:
                 # Récupération automatique et interpolation
                 with st.spinner("Récupération de la courbe des taux..."):
-                    swap_risk_free_rate = DATA_LOADER.get_risk_free_rate_from_curve(swap_maturity)
+                    swap_risk_free_rate = rf_from_curve(swap_maturity)
                     list_maturities = [(1/swap_frequency) * i for i in range(1, int(swap_maturity * swap_frequency) + 1)]
-                    list_risk_free_rates = [DATA_LOADER.get_risk_free_rate_from_curve(T) for T in list_maturities]
+                    list_risk_free_rates = [rf_from_curve(T) for T in list_maturities]
 
         # --- Affichage des Données de Taux (Specifique Swap) ---
         if rate_source == "Marché (FRED US Treasury)" and list_risk_free_rates != []:
@@ -496,7 +563,7 @@ def page_pricer():
             
             with col_chart:
                 st.markdown("###### Courbe des taux US Treasury (Globale)")
-                st.line_chart(DATA_LOADER.get_us_treasury_curve(), height=300)
+                st.line_chart(_yield_curve_cached(), height=300)
                 
             with col_df:
                 st.markdown("###### Taux utilisés pour le Pricing")
@@ -619,7 +686,7 @@ def page_pricer():
 
         ### Pourquoi le prix forward diffère-t-il du prix spot ?
         En l’absence d’opportunités d’arbitrage, deux stratégies doivent avoir le même coût :
-        - Acheter le sous-jacent aujourd’hui au prix spot \(S_0\) et le financer au taux sans risque \(r\),
+        - Acheter le sous-jacent aujourd’hui au prix spot $$S_0$$ et le financer au taux sans risque \(r\),
         - Attendre l’échéance \(T\) et acquérir le sous-jacent via un contrat forward.
 
         En présence d’un rendement continu \(q\) (dividendes, coupons ou convenience yield), le prix forward s’écrit :
@@ -629,10 +696,10 @@ def page_pricer():
 
         ### Exemple illustratif
         Considérons les paramètres suivants :
-        - Prix spot \(S_0 = 100\),
-        - Taux sans risque \(r = 3\%\),
-        - Rendement continu \(q = 1\%\),
-        - Maturité \(T = 1\) an.
+        - Prix spot $$S_0 = 100$$,
+        - Taux sans risque $$r = 3\%$$,
+        - Rendement continu $$q = 1\%$$,
+        - Maturité $$T = 1$$ an.
 
         Le prix forward est alors :
         $$
@@ -655,7 +722,7 @@ def page_pricer():
         with col_f2:
             rate_source = st.selectbox("Taux sans Risque (r)", 
                 ["Manuel", "Marché (FRED US Treasury)"],
-                index=1
+                index=0
             )
 
             if rate_source == "Manuel":
@@ -663,7 +730,7 @@ def page_pricer():
             else:
                 # Récupération automatique et interpolation
                 with st.spinner("Récupération de la courbe des taux..."):
-                    future_risk_free_rate = DATA_LOADER.get_risk_free_rate_from_curve(future_maturity)
+                    future_risk_free_rate = rf_from_curve(future_maturity)
                 st.success(f"Taux interpolé : **{future_risk_free_rate*100:.3f} %**")
 
         with col_f3:
@@ -723,35 +790,33 @@ def page_pricer():
         - Valorisation sous la **probabilité risque-neutre** : drift théorique du sous-jacent \(r-q\).
         - **Absence d’arbitrage** (cadre de référence).
         - Option **européenne** : exercice uniquement à maturité.
-        - Inputs \(r,\sigma,q\) **annualisés** et en **décimal** (ex : 20% → 0.20).
+        - Inputs $$r,\sigma ,q$$ **annualisés** et en **décimal** (ex : 20% → 0.20).
         """)
 
             st.markdown("### Black–Scholes (formule analytique)")
             st.markdown("- Sous-jacent modélisé par un **Mouvement Brownien Géométrique (GBM)** :")
             st.latex(r"dS_t = (r-q)\,S_t\,dt + \sigma S_t\,dW_t")
-            st.markdown(r"- \(\sigma\), \(r\) (et \(q\) si intégré) sont **constants**.")
+            st.markdown(r"- $$\sigma, r, q$$ sont **constants**.")
             st.markdown("- Marché sans friction (hypothèse standard), couverture continue (cadre idéal).")
 
             st.markdown("### Monte Carlo (GBM)")
             st.markdown("- Même dynamique GBM, mais estimation par simulation :")
             st.latex(r"\text{Prix} \approx e^{-rT}\,\frac{1}{N}\sum_{i=1}^{N}\text{Payoff}\!\left(S_T^{(i)}\right)")
-            st.markdown(r"- **Erreur statistique** décroît en \(1/\sqrt{N}\).")
+            st.markdown(r"- **Erreur statistique** décroît en $$\frac{1}{sqrt(N)}$$.")
             st.markdown(r"- Si discrétisation temporelle : **erreur de discrétisation** (dépend du nombre de steps).")
 
             st.markdown("### Heston (volatilité/variance stochastique)")
             st.markdown("- Variance stochastique (type CIR) :")
             st.latex(r"dS_t = (r-q)\,S_t\,dt + \sqrt{v_t}\,S_t\,dW_t^{S}")
-            st.latex(r"dv_t = \kappa(\theta - v_t)\,dt + \xi\sqrt{v_t}\,dW_t^{v}, \qquad \mathrm{corr}(dW^{S}, dW^{v})=\rho")
-            st.markdown(r"- \(\kappa\) : retour à la moyenne, \(\theta\) : variance long-terme, \(\xi\) : vol-of-vol, \(\rho\) : corrélation.")
+            st.latex(r"dv_t = \kappa(\theta - v_t)\,dt + x_i\sqrt{v_t}\,dW_t^{v}, \qquad \mathrm{corr}(dW^{S}, dW^{v})=\rho")
+            st.markdown(r"- $$\kappa$$ : retour à la moyenne, $$\theta$$ : variance long-terme, $$x_i$$ : vol-of-vol, $$\rho$$ : corrélation.")
             st.markdown("- Condition de Feller (positivité “forte” de la variance) :")
-            st.latex(r"2\kappa\theta \ge \xi^{2}")
-            st.markdown(r"- Si violée, \(v_t\) peut s’approcher plus souvent de 0 (selon le schéma numérique, ça peut aussi introduire un biais).")
+            st.latex(r"2\kappa\theta \ge x_i^{2}")
+            st.markdown(r"- Si violée, $$v_t$$ peut s’approcher plus souvent de 0 (selon le schéma numérique, ça peut aussi introduire un biais).")
 
             st.markdown("### Remarque sur le dividende (q)")
             st.markdown(r"""
-        - \(q\) représente un **rendement de dividende continu**.
-        - Selon l’implémentation, \(q\) peut être pris en compte uniquement par certaines méthodes.
-        Si \(q\) n’est pas intégré dans une méthode donnée, cela revient à considérer \(q=0\) (ou à le traiter implicitement via d’autres composantes).
+        - $$q$$ représente un **rendement de dividende continu**.
         """)
 
 
@@ -970,8 +1035,14 @@ def page_pricer():
             st.caption("Strike \(K\).")
 
         with col_o3:
-            option_volatility = st.number_input("Volatilité (σ, %)", min_value=0.0, value=20.0, step=0.1) / 100
-            st.caption("σ annualisée, saisie en % puis convertie en décimal.")
+            vol_source = st.selectbox("Source de volatilité (σ)", ["Manuel", "Marché (IV Yahoo)"], index=0)
+
+            if vol_source == "Manuel":
+                option_volatility = st.number_input("Volatilité (σ, %)", min_value=0.0, value=20.0, step=0.1) / 100
+                st.caption("σ annualisée, saisie en % puis convertie en décimal.")
+            else:
+                option_volatility = None
+                st.caption("σ récupérée depuis les options cotées (volatilité implicite).")
 
         with col_o4:
             option_type = st.selectbox("Type d'Option", ["call", "put"])
@@ -984,14 +1055,156 @@ def page_pricer():
                 st.caption("r annualisé, saisi en % puis converti en décimal.")
             else:
                 with st.spinner("Récupération de la courbe des taux..."):
-                    option_risk_free_rate = float(DATA_LOADER.get_risk_free_rate_from_curve(option_maturity))
+                    option_risk_free_rate = float(rf_from_curve(option_maturity))
                 st.success(f"Taux interpolé : **{option_risk_free_rate*100:.3f} %**")
                 st.caption("r obtenu via interpolation sur une courbe de taux.")
 
         with col_o6:
             dividend_yield = st.number_input("Rendement Dividende (q, %)", min_value=0.0, value=0.0, step=0.1) / 100
             st.caption("q = dividend yield continu (mettre 0 si non utilisé).")
-            st.info("Remarque : selon la méthode/implémentation, \(q\) peut ne pas être pris en compte partout.")
+
+        # =========================================================
+        # Volatilité : saisie manuelle ou volatilité implicite (Yahoo)
+        # =========================================================
+        spot_ticker_for_pricing = selected_ticker
+        K_user = float(option_strike)
+        option_strike_used = float(option_strike)
+        used_proxy = False
+        option_expiration = None
+
+        if vol_source != "Manuel":
+            with st.expander("⚙️ Volatilité implicite de marché (Yahoo Finance)", expanded=True):
+                pricing_ticker, expirations, used_proxy = resolve_ticker_for_options(selected_ticker)
+                spot_ticker_for_pricing = pricing_ticker if used_proxy else selected_ticker
+
+                if used_proxy:
+                    st.info(
+                        f"Pas de chaîne d'options disponible pour **{selected_ticker}** sur Yahoo "
+                        f"→ utilisation du proxy **{pricing_ticker}**."
+                    )
+
+                if not expirations:
+                    st.error("Aucune échéance d'options trouvée sur Yahoo Finance (ni pour ce ticker, ni pour un proxy).")
+                    # Fallback: keep original underlying/strike if market IV is unavailable
+                    spot_ticker_for_pricing = selected_ticker
+                    used_proxy = False
+                else:
+                    default_idx = nearest_expiration_index(expirations, option_maturity)
+                    option_expiration = st.selectbox("Expiration (pour IV)", expirations, index=default_idx)
+
+                    iv_mode = st.radio(
+                        "IV utilisée",
+                        ["impliedVolatility (Yahoo)", "Recalculée via Black-Scholes + prix marché"],
+                        index=0,
+                        horizontal=True
+                    )
+                    price_mode = st.radio(
+                        "Prix marché",
+                        ["mid (bid/ask)", "lastPrice"],
+                        index=0,
+                        horizontal=True
+                    )
+
+                    # Spots (index vs proxy) + conversion du strike si proxy
+                    spot_index = _spot_cached(selected_ticker)
+                    spot_proxy = _spot_cached(pricing_ticker)
+
+                    if used_proxy:
+                        moneyness = K_user / max(spot_index, 1e-12)
+                        option_strike_used = moneyness * spot_proxy
+                        st.caption(
+                            f"Conversion strike (moneyness conservée) : "
+                            f"K_index={K_user:.2f} / S_index={spot_index:.2f} = m={moneyness:.4f} ⇒ "
+                            f"K_proxy={option_strike_used:.2f} (S_proxy={spot_proxy:.2f})"
+                        )
+                    else:
+                        option_strike_used = K_user
+
+                    # Maturité à partir de l'expiration (cohérent avec IV)
+                    try:
+                        exp_date = datetime.strptime(option_expiration, "%Y-%m-%d")
+                        days_to_mat = max((exp_date - datetime.now()).days, 1)
+                        T_market = days_to_mat / 365.0
+                        option_maturity = float(T_market)
+                        st.caption(f"Maturité utilisée (d'après expiration) : **T={option_maturity:.4f} ans** (~{days_to_mat} jours).")
+
+                        if rate_source != "Manuel":
+                            option_risk_free_rate = float(rf_from_curve(option_maturity))
+                            st.caption(f"Taux FRED recalculé pour ce T : **{option_risk_free_rate*100:.3f}%**")
+                    except Exception as e:
+                        st.warning(f"Impossible de convertir l'expiration en maturité : {e}")
+
+                    # Récupération chaîne + IV
+                    try:
+                        chain = _chain_cached(pricing_ticker, option_expiration)
+                        df_opt = chain["calls"] if option_type == "call" else chain["puts"]
+
+                        if df_opt is None or df_opt.empty:
+                            st.error("Chaîne d'options vide (données indisponibles / faible liquidité).")
+                        else:
+                            df_opt = df_opt.copy()
+                            df_opt["abs_diff"] = (df_opt["strike"] - float(option_strike_used)).abs()
+                            row = df_opt.loc[df_opt["abs_diff"].idxmin()]
+
+                            strike_near = float(row.get("strike", option_strike_used))
+                            last_px = float(row.get("lastPrice", np.nan))
+                            bid = float(row.get("bid", np.nan))
+                            ask = float(row.get("ask", np.nan))
+                            mid_px = (bid + ask) / 2.0 if np.isfinite(bid) and np.isfinite(ask) and bid > 0 and ask > 0 else np.nan
+                            iv_yahoo = float(row.get("impliedVolatility", np.nan))
+
+                            market_price = mid_px if (price_mode.startswith("mid") and np.isfinite(mid_px)) else last_px
+
+                            c1, c2, c3 = st.columns(3)
+                            c1.metric("Strike (proche)", f"{strike_near:.2f}")
+                            c2.metric("Prix marché", f"{market_price:.4f}" if np.isfinite(market_price) else "n/a")
+                            c3.metric("IV Yahoo", f"{iv_yahoo*100:.2f}%" if np.isfinite(iv_yahoo) else "n/a")
+
+                            sigma_market = None
+
+                            # 1) Take Yahoo's impliedVolatility if available
+                            if iv_mode.startswith("impliedVolatility") and np.isfinite(iv_yahoo) and iv_yahoo > 0:
+                                sigma_market = float(iv_yahoo)
+
+                            # 2) Or recompute IV from a market price (last / mid) via BS
+                            else:
+                                if np.isfinite(market_price) and market_price > 0:
+                                    bs_model = BlackScholesModel()
+                                    params_iv = Parametres(
+                                        maturity=float(option_maturity),
+                                        risk_free_rate=float(option_risk_free_rate),
+                                        strike=float(option_strike_used),
+                                        volatility=0.2,
+                                        dividend=float(dividend_yield),
+                                    )
+                                    opt_iv = OptionVanille(
+                                        parameters=params_iv,
+                                        spot=float(spot_proxy if used_proxy else spot_index),
+                                        option=option_type
+                                    )
+
+                                    iv_calc = ImpliedVolatility(float(market_price), opt_iv, bs_model)
+                                    sigma_market = iv_calc.newton_raphson(initial_guess=0.2)
+                                    if sigma_market is None:
+                                        sigma_market = iv_calc.dichotomie()
+
+                            if sigma_market is None:
+                                st.error("Impossible de récupérer/calculer une IV fiable → fallback sur σ=20%.")
+                                option_volatility = 0.20
+                            else:
+                                option_volatility = float(sigma_market)
+                                st.success(f"Volatilité utilisée : **{option_volatility*100:.2f}%**")
+
+                            # Pour le pricing: utiliser le strike converti si proxy actif
+                            option_strike = float(option_strike_used)
+
+                    except Exception as e:
+                        st.error(f"Erreur lors de la récupération IV : {e}")
+                        option_volatility = 0.20
+
+        # Ensure sigma is always defined (avoid crashes in Heston defaults etc.)
+        if option_volatility is None:
+            option_volatility = 0.20
 
         # =========================================================
         # 2) Params spécifiques (GBM MC / Heston / American)
@@ -1010,7 +1223,7 @@ def page_pricer():
         if exercise_style == "European":
             if "Monte Carlo" in pricing_method and "GBM" in pricing_method:
                 st.markdown("###### Paramètres de Simulation (GBM)")
-                st.caption("N ↑ → variance de l’estimateur ↓ (≈ \(1/\sqrt{N}\)).")
+                st.caption(r"N ↑ → variance de l’estimateur ↓ (≈ $\frac{1}{\sqrt{N}}$)")
                 mc_col1, mc_col2, mc_col3 = st.columns(3)
                 with mc_col1:
                     n_simulations_gbm = st.slider("Nombre de simulations (N)", 1000, 100000, 200000, 1000)
@@ -1029,7 +1242,7 @@ def page_pricer():
                 with c1:
                     n_paths_lsm = st.slider("Nombre de paths (LSM)", 5000, 200000, 40000, 5000)
                 with c2:
-                    steps_lsm = st.slider("Steps (LSM)", 25, 500, 100, 25)
+                    steps_lsm = st.slider("Steps (LSM)", 25, 500, 50, 25)
                 with c3:
                     degree_lsm = st.selectbox("Degré polynôme (LSM)", [1, 2, 3], index=1)
                 with c4:
@@ -1050,18 +1263,16 @@ def page_pricer():
             vol2_default = float(option_volatility**2)
 
             with h1:
-                v0 = st.number_input("v0 (variance init)", min_value=0.0, value=vol2_default, step=0.001, format="%.4f")
+                v0 = st.number_input("$$V0$$ (variance initial)", min_value=0.0, value=vol2_default, step=0.001, format="%.4f")
             with h2:
-                kappa = st.number_input("kappa", min_value=0.0001, value=1.5, step=0.1, format="%.4f")
+                kappa = st.number_input("$$\kappa$$", min_value=0.0001, value=1.5, step=0.1, format="%.4f")
             with h3:
-                theta = st.number_input("theta (var long terme)", min_value=0.0, value=vol2_default, step=0.001, format="%.4f")
+                theta = st.number_input(r"$\theta$ (var long terme)", min_value=0.0, value=vol2_default, step=0.001, format="%.4f")
             with h4:
-                xi = st.number_input("xi (vol-of-vol)", min_value=0.0, value=0.5, step=0.05, format="%.4f")
+                xi = st.number_input("$$x_i$$ (vol-of-vol)", min_value=0.0, value=0.5, step=0.05, format="%.4f")
             with h5:
-                rho = st.slider("rho", min_value=-0.999, max_value=0.999, value=-0.7, step=0.01)
+                rho = st.slider(r"$$\rho$$", min_value=-0.999, max_value=0.999, value=-0.7, step=0.01)
 
-            if 2 * kappa * theta < xi * xi:
-                st.warning("⚠️ Condition de Feller violée (2*kappa*theta < xi^2). MC reste possible, mais v peut coller à 0 plus souvent.")
 
             st.markdown("###### Réglages Monte Carlo (Heston)")
             hh1, hh2, hh3, hh4 = st.columns(4)
@@ -1091,7 +1302,7 @@ def page_pricer():
             st.divider()
 
             # Spot actuel
-            spot_price = float(DATA_LOADER.get_equity_spot(selected_ticker))
+            spot_price = float(_spot_cached(spot_ticker_for_pricing))
 
             # Objet OptionVanille (instrument) + inject dividend into Parametres
             option_params = Parametres(
@@ -1124,7 +1335,7 @@ def page_pricer():
 
                 elif "Heston" in pricing_method:
                     heston_model = HestonMonteCarloModel(chunk_size=20000)
-                    st.markdown("### Pourquoi Heston ne donne pas le même prix que Black–Scholes (même en mettant “σ = 20%”)")
+                    st.markdown("### Pourquoi Heston ne donne pas le même prix que Black–Scholes (même en mettant $$\sigma = 20\%$$)")
                     st.markdown("""
                     Black–Scholes et Heston ne “voient” pas la même chose :
 
@@ -1137,20 +1348,20 @@ def page_pricer():
 
                     st.markdown("""
                     Conséquences pratiques :
-                    - Même si tu prends \(v_0=\sigma^2\) et \(\theta=\sigma^2\), tu peux avoir un prix différent si la variance est aléatoire (vol-of-vol).
-                    - La corrélation change la forme de la distribution (skew) : avec \(\rho<0\), les calls ATM peuvent être **moins chers** que BS à vol “moyenne” égale.
-                    - Si la **condition de Feller** est violée, certains schémas de discrétisation peuvent garder \(v_t\) trop souvent proche de 0 → vol effective plus faible → prix plus bas.
-                    - Si les paramètres Heston ne sont **pas calibrés** sur une surface de volatilité implicite, tu prices juste “un autre monde” que celui résumé par « σ = 20% ».
+                    - Même en prenant $$v_0=\sigma^2$$ et $$\theta=\sigma^2$$, tu peux avoir un prix différent si la variance est aléatoire (vol-of-vol).
+                    - La corrélation change la forme de la distribution (skew) : avec $$\rho<0$$, les calls ATM peuvent être **moins chers** que BS à vol “moyenne” égale.
+                    - Si la **condition de Feller** est violée, certains schémas de discrétisation peuvent garder $$v_t$$ trop souvent proche de 0 → vol effective plus faible → prix plus bas.
+                    - Si les paramètres Heston ne sont **pas calibrés** sur une surface de volatilité implicite, tu prices juste “un autre monde” que celui résumé par « $$\sigma = 20\%$$ ».
                     """)
 
                     # Relations utiles en LaTeX
                     st.markdown("Relations (rappel) :")
                     st.latex(r"v_0=\sigma^2,\quad \theta=\sigma^2")
-                    st.latex(r"2\kappa\theta \ge \xi^2 \quad \text{(condition de Feller)}")
+                    st.latex(r"2\kappa\theta \ge x_i^2 \quad \text{(condition de Feller)}")
 
-                    st.markdown(r"""**Vérification (Heston ≈ Black–Scholes)** : en imposant une variance quasi déterministe (par exemple $\xi \approx 0$) et en fixant $v_0=\theta=\sigma^2$, le modèle de Heston **se réduit asymptotiquement** à Black–Scholes ; les prix obtenus doivent alors être **très proches**, à l’erreur Monte Carlo près.""")
+                    st.markdown(r"""**Vérification (Heston ≈ Black–Scholes)** : en imposant une variance quasi déterministe (par exemple $x_i \approx 0$) et en fixant $v_0=\theta=\sigma^2$, le modèle de Heston **se réduit asymptotiquement** à Black–Scholes ; les prix obtenus doivent alors être **très proches**, à l’erreur Monte Carlo près.""")
 
-                    st.latex(r"\xi \approx 0,\quad v_0=\theta=\sigma^2")
+                    st.latex(r"x_i \approx 0,\quad v_0=\theta=\sigma^2")
 
 
                     with st.spinner("Simulation Monte Carlo (Heston) en cours..."):
@@ -1355,14 +1566,80 @@ def page_pricer():
                 for i, (k, v) in enumerate(greeks_val.items()):
                     cols[i].metric(k, f"{v:.4f}")
 
+                # --- ÉVOLUTION DES GRECQUES (comme dans CodeAnto1) ---
+                with st.expander("📈 Évolution des grecques (Black-Scholes)", expanded=True):
+                    st.caption("Courbes des grecques en fonction du spot S (autour du strike K). Trait rouge = K, trait gris = spot actuel.")
+
+                    range_pct = st.slider(
+                        "Amplitude autour du strike (± en proportion)",
+                        min_value=0.05, max_value=1.00, value=0.50, step=0.05,
+                        key="ov_greeks_range_pct"
+                    )
+                    steps_g = st.slider(
+                        "Nombre de points pour les courbes",
+                        min_value=20, max_value=200, value=80, step=10,
+                        key="ov_greeks_range_steps"
+                    )
+
+                    greeks_data = bs_model.compute_greeks_range(option, range_pct=float(range_pct), steps=int(steps_g))
+                    df_greeks = pd.DataFrame(greeks_data)
+
+                    greeks_config = [
+                        {"label": "Delta (Δ)", "value": bs_model.delta(option), "key": "Delta"},
+                        {"label": "Gamma (Γ)", "value": bs_model.gamma(option), "key": "Gamma"},
+                        {"label": "Vega (ν)",  "value": bs_model.vega(option),  "key": "Vega"},
+                        {"label": "Theta (Θ)", "value": bs_model.theta(option), "key": "Theta"},
+                        {"label": "Rho (ρ)",   "value": bs_model.rho(option),   "key": "Rho"},
+                    ]
+
+                    strike_line = alt.Chart(pd.DataFrame({"x": [float(option_strike)]})).mark_rule(
+                        color="red", strokeDash=[5, 5]
+                    ).encode(x="x:Q")
+
+                    spot_line = alt.Chart(pd.DataFrame({"x": [float(spot_price)]})).mark_rule(
+                        color="gray", strokeDash=[2, 2]
+                    ).encode(x="x:Q")
+
+                    for item in greeks_config:
+                        col_metric, col_chart = st.columns([1, 2])
+
+                        with col_metric:
+                            st.metric(item["label"], f"{item['value']:.4f}")
+
+                        with col_chart:
+                            greek_key = item["key"]
+                            chart_line = alt.Chart(df_greeks).mark_line().encode(
+                                x=alt.X("S:Q", title="Spot (S)"),
+                                y=alt.Y(f"{greek_key}:Q", title=None),
+                                tooltip=[
+                                    alt.Tooltip("S:Q", format=",.2f"),
+                                    alt.Tooltip(f"{greek_key}:Q", format=",.4f")
+                                ]
+                            )
+                            final_chart = (chart_line + strike_line + spot_line).properties(
+                                height=200,
+                                title=f"{greek_key}"
+                            ).interactive()
+                            st.altair_chart(final_chart, use_container_width=True)
+
+                        st.markdown("<hr style='margin: 0px; opacity: 0.2;'>", unsafe_allow_html=True)
+
             elif exercise_style == "European" and ("Monte Carlo" in pricing_method and "GBM" in pricing_method):
                 with st.spinner("Calcul des Grecques par chocs (GBM MC)..."):
-                    delta_mc, gamma_mc, vega_mc = mc_model.Greeks_diff_MC(option, h=spot_price*0.01)
-                g1, g2, g3 = st.columns(3)
+                    delta_mc, gamma_mc, vega_mc, theta_mc, rho_mc = mc_model.Greeks_diff_MC(
+                        option,
+                        h=spot_price * 0.01,
+                        h_vol=0.001,        # 10 bps vol
+                        h_r=1e-4,           # 1 bp rate
+                        h_T=1/365.25        # 1 day
+                    )
+
+                g1, g2, g3, g4, g5 = st.columns(5)
                 g1.metric("Delta (MC)", f"{delta_mc:.4f}")
                 g2.metric("Gamma (MC)", f"{gamma_mc:.4f}")
                 g3.metric("Vega (MC)", f"{vega_mc:.4f}")
-                st.info("Theta/Rho non affichées ici (temps de calcul).")
+                g4.metric("Theta (MC)", f"{theta_mc:.4f}")
+                g5.metric("Rho (MC)", f"{rho_mc:.4f}")
 
             elif exercise_style == "European" and ("Heston" in pricing_method):
                 st.info("Greeks Heston : non implémentées (bumping Heston possible, mais coûteux et bruité).")
@@ -1468,16 +1745,14 @@ def page_pricer():
             st.markdown("""
             ### Exemple
             Suppose que l’option regarde 5 observations de prix :
-            \\[
-            (100,\ 102,\ 98,\ 101,\ 99)
-            \\]
+            [100, 102, 98, 101, 99]
             Moyenne = 100.0
 
-            - Si K=100 et que c’est un Call asiatique (moyenne arithmétique) :
-            payoff = max(100 - 100, 0) = 0
+            - Si $K=100$ et que c’est un Call asiatique (moyenne arithmétique) :
+            $payoff = max(100 - 100, 0) = 0$
 
             Comparaison :
-            - Une option vanille regarderait seulement \\(S_T\\) (le dernier prix).
+            - Une option vanille regarderait seulement $$S_T$$ (le dernier prix).
             - L’asiatique “lisse” les pics → souvent **moins chère**.
             """)
 
@@ -1510,7 +1785,7 @@ def page_pricer():
             if rate_source == "Manuel":
                 r = st.number_input("Taux sans risque ($r$ %)", 0.0, 20.0, 3.0) / 100
             else:
-                r = DATA_LOADER.get_risk_free_rate_from_curve(maturity)
+                r = rf_from_curve(maturity)
                 st.info(f"Taux marché : {r*100:.2f} %")
 
         with col_asia3:
@@ -1671,12 +1946,12 @@ def page_pricer():
             ### 1) Up-and-Out Call (barrière désactivante)
             - Tu as un Call, MAIS si le prix touche la barrière B à n’importe quel moment → l’option devient 0.
             - Exemple : K=100, B=140  
-            Même si à la fin S_T=160, si le chemin a touché 140 avant → payoff = 0.
+            Même si à la fin $S_T=160$, si le chemin a touché 140 avant → payoff = 0.
 
             ### 2) Up-and-In Call (barrière activante)
             - L’option n’existe “vraiment” que si le prix touche B.
             - Exemple : K=100, B=140  
-            Si le prix ne touche jamais 140 → payoff = 0 même si S_T=160 (selon définition).
+            Si le prix ne touche jamais 140 → payoff = 0 même si $S_T=160$.
 
             ### 3) Pourquoi le Brownian Bridge ?
             Même si tu simules à dates discrètes, le prix peut franchir la barrière entre deux pas :
@@ -1709,7 +1984,7 @@ def page_pricer():
             if rate_source == "Manuel":
                 r = st.number_input("Taux sans risque ($r$ %)", 0.0, 20.0, 3.0) / 100
             else:
-                r = DATA_LOADER.get_risk_free_rate_from_curve(maturity)
+                r = rf_from_curve(maturity)
                 st.info(f"Taux marché : {r*100:.2f} %")
 
         with col_b3:
@@ -1819,11 +2094,14 @@ def page_pricer():
                 cols_g = st.columns(5)
                 cols_g[0].metric("Delta", f"{greeks_barrier['Delta']:.4f}")
                 cols_g[1].metric("Gamma", f"{greeks_barrier['Gamma']:.4f}")
-                cols_g[2].metric("Vega",  f"{greeks_barrier['Vega']:.4f}")
-                cols_g[3].metric("Theta", "N/A" if greeks_barrier["Theta"] is None else f"{greeks_barrier['Theta']:.4f}")
-                cols_g[4].metric("Rho",   f"{greeks_barrier['Rho']:.4f}")
+                cols_g[2].metric("Vega (€/1% vol)",  f"{greeks_barrier['Vega']:.4f}")
+                cols_g[3].metric("Theta (€/jour)", "N/A" if greeks_barrier["Theta"] is None else f"{greeks_barrier['Theta']:.4f}")
+                cols_g[4].metric("Rho (€/1bp)",   f"{greeks_barrier['Rho']:.4f}")
 
-                st.caption("Note : pour les barrières, les grecques (surtout Gamma/Theta) peuvent être bruitées en Monte Carlo. Augmente `num_simulations` si besoin.")
+                st.caption(
+                    "Unités : Vega est affiché par +1% de volatilité, Rho par +1 bp de taux, Theta par jour. "
+                    "Note : pour les barrières, les grecques (surtout Gamma/Theta) peuvent être bruitées en Monte Carlo — augmentez les simulations si besoin."
+                )
 
             except Exception as e:
                 st.error(f"Erreur de calcul : {e}")
@@ -1897,11 +2175,11 @@ def page_calibration():
             return
 
     with col3:
-        rate_source = st.radio("Source Taux sans risque", ["Automatique (Courbe)", "Manuel"], horizontal=True)
+        rate_source = st.radio("Source Taux sans risque", ["Manuel", "Automatique (Courbe)"], horizontal=True)
         if rate_source == "Manuel":
             risk_free_rate = st.number_input("Taux ($r$ %)", 0.0, 20.0, 4.0) / 100
         else:
-            risk_free_rate = DATA_LOADER.get_risk_free_rate_from_curve(maturity)
+            risk_free_rate = rf_from_curve(maturity)
             st.info(f"Taux interpolé : **{risk_free_rate*100:.3f} %**")
 
     # Ligne 2 : Option Spécifique
@@ -1947,70 +2225,73 @@ def page_calibration():
 
     # --- CALIBRATION ---
     st.subheader("Algorithme de Calibration")
-    
+
     calibration_method = st.radio(
-        "Méthode Numérique", 
+        "Méthode Numérique",
         ["Newton-Raphson (Gradient)", "Bisection (Dichotomie)"]
     )
-        
+
     if st.button("Lancer la Calibration", type="primary"):
-            
-        # 1. Instanciation des objets
-        params = Parametres(maturity=maturity, risk_free_rate=risk_free_rate, strike=option_strike, volatility=0.2) # Vol initiale arbitraire
+
+        params = Parametres(
+            maturity=maturity,
+            risk_free_rate=risk_free_rate,
+            strike=option_strike,
+            volatility=0.2
+        )
         option = OptionVanille(parameters=params, spot=S0, option=option_type)
         bs_model = BlackScholesModel()
-            
         solver = ImpliedVolatility(market_price, option, bs_model)
-            
-        # 2. Résolution
+
         start_time = datetime.now()
-        if "Newton" in calibration_method:
-            implied_vol = solver.newton_raphson()
-        else:
-            implied_vol = solver.dichotomie()
+        implied_vol = solver.newton_raphson() if "Newton" in calibration_method else solver.dichotomie()
         end_time = datetime.now()
-        duration = (end_time - start_time).microseconds / 1000 # ms
-            
-        # 3. Affichage Résultat
+        duration = (end_time - start_time).total_seconds() * 1000  # ms
+
         if implied_vol is not None and 0 < implied_vol < 5:
             st.success(f"Calibration réussie en {duration:.1f} ms")
-                
-            # Joli affichage métrique
+
+            solved_vol = float(implied_vol)
+            option.parameters.volatility = solved_vol
+
+            price_recalc = bs_model.price_option(option)
+            vega_recalc  = bs_model.vega(option)
+
             c_res1, c_res2, c_res3 = st.columns(3)
-            c_res1.metric("Volatilité Implicite", f"{implied_vol*100:.2f} %")
-            c_res2.metric("Prix Re-calculé", f"{bs_model.price_option(option):.2f} €", delta="0.00 €")
-            c_res3.metric("Vega (Sensibilité)", f"{bs_model.vega(option):.4f}")
-                
-            # Graphique de Convergence (Visuel Pédagogique)
-            # On trace le prix BS en fonction de la vol pour montrer l'intersection
-            vol_range = np.linspace(max(0.01, implied_vol-0.3), implied_vol+0.3, 50)
+            c_res1.metric("Volatilité Implicite", f"{solved_vol*100:.2f} %")
+            c_res2.metric("Prix Re-calculé", f"{price_recalc:.2f} €", delta=f"{price_recalc - market_price:+.2f} €")
+            c_res3.metric("Vega (Sensibilité)", f"{vega_recalc:.4f}")
+
+            vol_range = np.linspace(max(0.01, solved_vol - 0.3), solved_vol + 0.3, 50)
             prices = []
             for v in vol_range:
-                option.parameters.volatility = v
+                option.parameters.volatility = float(v)
                 prices.append(bs_model.price_option(option))
-                
-            # Reset la bonne vol
-            option.parameters.volatility = implied_vol
+
+            option.parameters.volatility = solved_vol  # restore
 
             df_chart = pd.DataFrame({"Volatilité": vol_range, "Prix Théorique": prices})
-                
-            # Ligne du prix théorique
+
             base_chart = alt.Chart(df_chart).mark_line().encode(
-                x=alt.X('Volatilité', axis=alt.Axis(format='%')),
-                y='Prix Théorique'
+                x=alt.X("Volatilité", axis=alt.Axis(format="%")),
+                y="Prix Théorique"
             )
-                
-            # Ligne horizontale du prix marché
-            market_line = alt.Chart(pd.DataFrame({'y': [market_price]})).mark_rule(color='red', strokeDash=[5,5]).encode(y='y')
-                
-            # Point solution
-            point = alt.Chart(pd.DataFrame({'x': [implied_vol], 'y': [market_price]})).mark_point(color='green', size=100, filled=True).encode(x='x', y='y')
-                
-            st.altair_chart((base_chart + market_line + point).properties(title="Visualisation de la Solution (Volatilité vs Prix)"), use_container_width=True)
-            st.caption("La ligne bleue est le prix théorique BS en fonction de la vol. La ligne rouge est le prix de marché observé. Le point vert est la solution trouvée.")
+
+            market_line = alt.Chart(pd.DataFrame({"y": [market_price]})).mark_rule(
+                color="red", strokeDash=[5, 5]
+            ).encode(y="y")
+
+            point = alt.Chart(pd.DataFrame({"x": [solved_vol], "y": [market_price]})).mark_point(
+                color="green", size=100, filled=True
+            ).encode(x="x", y="y")
+
+            st.altair_chart((base_chart + market_line + point).properties(
+                title="Visualisation de la Solution (Volatilité vs Prix)"
+            ), use_container_width=True)
 
         else:
             st.error("Échec de la calibration. Vérifiez si le prix de marché est cohérent (pas d'arbitrage).")
+
 
 def page_surface():
     st.header("Analyse de Surface de Volatilité")
@@ -2021,7 +2302,7 @@ def page_surface():
     st.markdown(r"""
 ### C’est quoi une *surface de volatilité implicite* ?
 
-La **volatilité implicite** (IV) est la volatilité \(\sigma\) qui rend le prix théorique (souvent via Black–Scholes)
+La **volatilité implicite** (IV) est la volatilité $$\sigma$$ qui rend le prix théorique (souvent via Black–Scholes)
 **égal au prix observé sur le marché** :
 
 $$
@@ -2029,7 +2310,7 @@ C_{\text{BS}}(S_0,K,T,r,q,\sigma)=C_{\text{mkt}}
 \qquad\text{(pour un call)}
 $$
 
-Autrement dit, on **inverse** le modèle : on cherche \(\sigma\) telle que la différence
+Autrement dit, on **inverse** le modèle : on cherche $$\sigma$$ telle que la différence
 $$
 f(\sigma)=C_{\text{BS}}(\sigma)-C_{\text{mkt}}=0
 $$
@@ -2058,9 +2339,9 @@ et on représente cette fonction en 3D (ou en heatmap).
 - Axe **Z** : la **volatilité implicite** $$\sigma_{\text{impl}}(K,T)$$
 
 Souvent, on regarde aussi la **moneyness** :
-\[
+$$
 \text{Moneyness}=\frac{K}{S_0}
-\]
+$$
 
 - $$\frac{K}{S_0}<1$$ : option plutôt **ITM** (call)
 - $$\frac{K}{S_0}\approx 1$$ : **ATM**
@@ -2069,8 +2350,8 @@ Souvent, on regarde aussi la **moneyness** :
 ---
 
 ### Smile / Skew (intuition)
-- Si $$\sigma_{\text{impl}}$$ varie avec \(K\) à \(T\) fixé → on observe un **smile** ou un **skew**
-- Si $$\sigma_{\text{impl}}$$ varie avec \(T\) → structure par terme de volatilité
+- Si $$\sigma_{\text{impl}}$$ varie avec $$K$$ à $$T$$ fixé → on observe un **smile** ou un **skew**
+- Si $$\sigma_{\text{impl}}$$ varie avec $$T$$ → structure par terme de volatilité
 
 Une surface complètement “plate” ($$\sigma_{\text{impl}}(K,T)\approx \sigma$$ constante) correspondrait à l’hypothèse
 Black–Scholes “idéale”, ce qui est rare sur des données réelles.
@@ -2167,7 +2448,7 @@ $$
 
 
 def page_structured_products():
-    st.header("🏭 Structuration de Produits")
+    st.header("Structuration de Produits")
 
     # --- 1. SESSION STATE (Mémoire de la page) ---
     if 'struct_legs' not in st.session_state:
@@ -2250,13 +2531,13 @@ def page_structured_products():
         st.success(f"✅ Stratégie ajoutée au builder : {strategy_name}")
         st.rerun()
 
-    # --- 2. PARTIE PÉDAGOGIQUE (NE PAS SUPPRIMER) ---
+    # --- 2. PARTIE PÉDAGOGIQUE ---
     with st.expander("📘 Cours : Legs, prix, payoff et PnL (produits structurés)", expanded=False):
         st.markdown("""
     Un produit structuré se comprend comme un assemblage de **jambes (legs)**.
     Chaque jambe est définie par :
     - un **instrument** (option, obligation, sous-jacent, …),
-    - une **quantité** \(q_i\) (positive = *long*, négative = *short*),
+    - une **quantité** $$q_i$$ (positive = *long*, négative = *short*),
     - éventuellement un **modèle** de pricing (BS, arbre, MC…).
 
     L’idée centrale : **linéarité** (on additionne prix / payoff jambe par jambe).
@@ -2285,7 +2566,7 @@ def page_structured_products():
         st.latex(r"V_T^{\text{put}}(S_T)=\max(K-S_T,0)")
 
 
-    with st.expander("🧠 Hypothèses et limites (cadre de pricing)", expanded=False):
+    with st.expander("🧠 Hypothèses et limites", expanded=False):
         st.markdown("""
     ### Hypothèses de modélisation (options vanilles)
 
@@ -2349,14 +2630,14 @@ def page_structured_products():
     **Intuition :**
     - tu paies une prime (les 2 options),
     - tu gagnes si le sous-jacent bouge beaucoup (vers le haut ou vers le bas),
-    - tu perds si le sous-jacent reste proche de \(K\).
+    - tu perds si le sous-jacent reste proche de $$K$$.
 
     ---
 
     ### 2) Bull Call Spread
     Legs :
-    - \(+1\) Call(\(K_1\))
-    - \(-1\) Call(\(K_2\)) avec \(K_1<K_2\)
+    - $$+1$$ Call($$K_1$$)
+    - $$-1$$ Call($$K_2$$) avec $$K_1<K_2$$
 
     Intuition :
     - tu finances une partie du call acheté en vendant un call plus haut,
@@ -2366,13 +2647,13 @@ def page_structured_products():
 
     ### 3) Butterfly (calls)
     Legs :
-    - \(+1\) Call(\(K_1\))
-    - \(-2\) Call(\(K_2\))
-    - \(+1\) Call(\(K_3\)) avec \(K_1<K_2<K_3\)
+    - $$+1$$ Call($$K_1$$)
+    - $$-2$$ Call($$K_2$$)
+    - $$+1$$ Call($$K_3$$) avec $$K_1<K_2<K_3$$
 
     Intuition :
-    - payoff max autour de \(K_2\),
-    - stratégie “range” (tu gagnes si \(S_T\) reste près du milieu).
+    - payoff max autour de $$K_2$$,
+    - stratégie “range” (tu gagnes si $$S_T$$ reste près du milieu).
     """)
 
 
@@ -2396,7 +2677,7 @@ def page_structured_products():
 
     with col_g3:
         try:
-            r_market = DATA_LOADER.get_risk_free_rate_from_curve(global_maturity)
+            r_market = rf_from_curve(global_maturity)
         except Exception:
             r_market = 0.03
         r_input = st.number_input("Taux sans risque (r)", value=float(r_market), format="%.4f", key="struct_rate")
@@ -2569,7 +2850,7 @@ def page_structured_products():
     with tabB:
         # --- Templates rapides dans le Builder ---
         with st.container(border=True):
-            st.markdown("### ⚡ Templates rapides (ajout automatique de legs)")
+            st.markdown("### Templates rapides (ajout automatique de legs)")
             cT1, cT2, cT3 = st.columns([1.4, 1, 1])
 
             with cT1:
@@ -2668,7 +2949,7 @@ def page_structured_products():
         st.divider()
         st.subheader("4. Analyse & Payoff")
 
-        if st.button("🚀 Lancer la Structuration", disabled=(len(st.session_state.struct_legs) == 0), key="run_manual"):
+        if st.button("Lancer la Structuration", disabled=(len(st.session_state.struct_legs) == 0), key="run_manual"):
 
             try:
                 my_product = StructuredProduct(name="Mon Produit Perso")

@@ -14,13 +14,19 @@ class BlackScholesModel:
 
     # ---------- helpers ----------
     @staticmethod
-    def _to_decimal(x: float) -> float:
-        """
-        Heuristic: if x looks like a percent (e.g. 3 or 20), convert to decimal (0.03 / 0.20).
-        If you already pass decimals everywhere, this won't change typical values (<1).
+    def _to_decimal(x: float, *, assume_percent_if_gt1: bool = True) -> float:
+        """Convert common "percent" inputs to decimals.
+
+        By default we apply a small guardrail: if |x| > 1 we assume the user may have
+        entered a percentage (e.g. 3 for 3%) and convert to a decimal (0.03).
+
+        Important: for *volatility* we often need to allow values > 1 (e.g. 150% vol = 1.50),
+        so callers can disable the heuristic with assume_percent_if_gt1=False.
         """
         x = float(x)
-        return x / 100.0 if abs(x) > 1.0 else x
+        if assume_percent_if_gt1 and abs(x) > 1.0:
+            return x / 100.0
+        return x
 
     @staticmethod
     def _get_q(params) -> float:
@@ -52,11 +58,12 @@ class BlackScholesModel:
         S = option.spot
         params = option.parameters
 
-        r = self._to_decimal(params.get_risk_free_rate())
+        r = self._to_decimal(params.get_risk_free_rate(), assume_percent_if_gt1=True)
         T = float(params.get_maturity())
         K = float(params.get_strike())
-        sigma = self._to_decimal(params.get_volatility())
-        q = self._to_decimal(self._get_q(params))
+        # Volatility can legitimately be > 1.0 (i.e. > 100%), so do NOT auto-divide by 100.
+        sigma = self._to_decimal(params.get_volatility(), assume_percent_if_gt1=False)
+        q = self._to_decimal(self._get_q(params), assume_percent_if_gt1=True)
 
         # Handle expiry / degenerate vol
         if T <= 0:
@@ -93,11 +100,11 @@ class BlackScholesModel:
         S = option.spot
         params = option.parameters
 
-        r = self._to_decimal(params.get_risk_free_rate())
+        r = self._to_decimal(params.get_risk_free_rate(), assume_percent_if_gt1=True)
         T = float(params.get_maturity())
         K = float(params.get_strike())
-        sigma = self._to_decimal(params.get_volatility())
-        q = self._to_decimal(self._get_q(params))
+        sigma = self._to_decimal(params.get_volatility(), assume_percent_if_gt1=False)
+        q = self._to_decimal(self._get_q(params), assume_percent_if_gt1=True)
 
         if T <= 0 or sigma <= 0:
             # At expiry: delta is not well-defined at-the-money; use a simple convention
@@ -124,11 +131,11 @@ class BlackScholesModel:
         S = np.asarray(option.spot, dtype=float)
         params = option.parameters
 
-        r = self._to_decimal(params.get_risk_free_rate())
+        r = self._to_decimal(params.get_risk_free_rate(), assume_percent_if_gt1=True)
         T = float(params.get_maturity())
         K = float(params.get_strike())
-        sigma = self._to_decimal(params.get_volatility())
-        q = self._to_decimal(self._get_q(params))
+        sigma = self._to_decimal(params.get_volatility(), assume_percent_if_gt1=False)
+        q = self._to_decimal(self._get_q(params), assume_percent_if_gt1=True)
 
         if T <= 0 or sigma <= 0:
             out = np.zeros_like(S, dtype=float)
@@ -143,11 +150,11 @@ class BlackScholesModel:
         S = np.asarray(option.spot, dtype=float)
         params = option.parameters
 
-        r = self._to_decimal(params.get_risk_free_rate())
+        r = self._to_decimal(params.get_risk_free_rate(), assume_percent_if_gt1=True)
         T = float(params.get_maturity())
         K = float(params.get_strike())
-        sigma = self._to_decimal(params.get_volatility())
-        q = self._to_decimal(self._get_q(params))
+        sigma = self._to_decimal(params.get_volatility(), assume_percent_if_gt1=False)
+        q = self._to_decimal(self._get_q(params), assume_percent_if_gt1=True)
 
         if T <= 0 or sigma <= 0:
             out = np.zeros_like(S, dtype=float)
@@ -163,11 +170,11 @@ class BlackScholesModel:
         S = option.spot
         params = option.parameters
 
-        r = self._to_decimal(params.get_risk_free_rate())
+        r = self._to_decimal(params.get_risk_free_rate(), assume_percent_if_gt1=True)
         T = float(params.get_maturity())
         K = float(params.get_strike())
-        sigma = self._to_decimal(params.get_volatility())
-        q = self._to_decimal(self._get_q(params))
+        sigma = self._to_decimal(params.get_volatility(), assume_percent_if_gt1=False)
+        q = self._to_decimal(self._get_q(params), assume_percent_if_gt1=True)
 
         if T <= 0 or sigma <= 0:
             return 0.0
@@ -191,11 +198,11 @@ class BlackScholesModel:
         S = np.asarray(option.spot, dtype=float)
         params = option.parameters
 
-        r = self._to_decimal(params.get_risk_free_rate())
+        r = self._to_decimal(params.get_risk_free_rate(), assume_percent_if_gt1=True)
         T = float(params.get_maturity())
         K = float(params.get_strike())
-        sigma = self._to_decimal(params.get_volatility())
-        q = self._to_decimal(self._get_q(params))
+        sigma = self._to_decimal(params.get_volatility(), assume_percent_if_gt1=False)
+        q = self._to_decimal(self._get_q(params), assume_percent_if_gt1=True)
 
         if T <= 0 or sigma <= 0:
             out = np.zeros_like(S, dtype=float)

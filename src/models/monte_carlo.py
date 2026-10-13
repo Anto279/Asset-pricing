@@ -57,39 +57,85 @@ class MonteCarloModel:
 
         return float(np.exp(-r * T) * np.mean(payoffs))
 
-    def Greeks_diff_MC(self, option: OptionVanille, h: float | None = None):
+    def Greeks_diff_MC(
+        self,
+        option: OptionVanille,
+        h: float | None = None,
+        h_vol: float = 0.001,   # 10 bps vol
+        h_r: float = 1e-4,      # 1 bp rate
+        h_T: float = 1 / 365.25 # 1 day (in years)
+    ):
+        """
+        Greeks by finite differences using common random numbers (same seed).
+        Returns (Delta, Gamma, Vega, Theta, Rho) with the same conventions as BlackScholesModel:
+
+        - Delta, Gamma: spot sensitivities.
+        - Vega: dV/dσ (σ in decimal, so 'per +1.00 vol' i.e. +100 vol points).
+        - Theta: per YEAR (calendar theta) approximated by bumping maturity down by h_T.
+        - Rho: dV/dr (r in decimal, so 'per +1.00 rate' i.e. +100% rate).
+        """
         if h is None:
             h = float(option.spot) * 0.01
 
         fixed_seed = 42
+
+        # --- Base price ---
         price_central = self.price_option(option, seed=fixed_seed)
 
-        option_up = OptionVanille(option.parameters, spot=option.spot + h, option=option.option)
+        # --- Delta / Gamma ---
+        option_up = OptionVanille(option.parameters, spot=float(option.spot) + h, option=option.option)
         price_up = self.price_option(option_up, seed=fixed_seed)
 
-        option_down = OptionVanille(option.parameters, spot=option.spot - h, option=option.option)
+        option_down = OptionVanille(option.parameters, spot=float(option.spot) - h, option=option.option)
         price_down = self.price_option(option_down, seed=fixed_seed)
 
-        delta = (price_up - price_down) / (2 * h)
-        gamma = (price_up - 2 * price_central + price_down) / (h ** 2)
+        delta = (price_up - price_down) / (2.0 * h)
+        gamma = (price_up - 2.0 * price_central + price_down) / (h ** 2)
 
-        # Vega bump (0.001 = 10 bps vol)
-        h_vol = 0.001
+        # --- Vega ---
         q0 = self._get_q(option.parameters)
-
-        new_params = Parametres(
+        new_params_vol = Parametres(
             maturity=option.parameters.get_maturity(),
             risk_free_rate=option.parameters.get_risk_free_rate(),
             strike=option.parameters.get_strike(),
-            volatility=option.parameters.get_volatility() + h_vol,
-            dividend=q0,  # ✅ preserve dividend yield
+            volatility=float(option.parameters.get_volatility()) + float(h_vol),
+            dividend=q0,
         )
-
-        option_vega_up = OptionVanille(new_params, spot=option.spot, option=option.option)
+        option_vega_up = OptionVanille(new_params_vol, spot=float(option.spot), option=option.option)
         price_vega_up = self.price_option(option_vega_up, seed=fixed_seed)
+        vega = (price_vega_up - price_central) / float(h_vol)
 
-        vega = (price_vega_up - price_central) / h_vol
-        return float(delta), float(gamma), float(vega)
+        # --- Theta (calendar) : price at T-h_T vs price at T ---
+        T0 = float(option.parameters.get_maturity())
+        T_dn = max(T0 - float(h_T), 1e-10)
+
+        new_params_T = Parametres(
+            maturity=T_dn,
+            risk_free_rate=option.parameters.get_risk_free_rate(),
+            strike=option.parameters.get_strike(),
+            volatility=option.parameters.get_volatility(),
+            dividend=q0,
+        )
+        option_T_dn = OptionVanille(new_params_T, spot=float(option.spot), option=option.option)
+        price_T_dn = self.price_option(option_T_dn, seed=fixed_seed)
+
+        theta = (price_T_dn - price_central) / float(h_T)
+
+        # --- Rho ---
+        r0 = float(option.parameters.get_risk_free_rate())
+        new_params_r = Parametres(
+            maturity=option.parameters.get_maturity(),
+            risk_free_rate=r0 + float(h_r),
+            strike=option.parameters.get_strike(),
+            volatility=option.parameters.get_volatility(),
+            dividend=q0,
+        )
+        option_r_up = OptionVanille(new_params_r, spot=float(option.spot), option=option.option)
+        price_r_up = self.price_option(option_r_up, seed=fixed_seed)
+
+        rho = (price_r_up - price_central) / float(h_r)
+
+        return float(delta), float(gamma), float(vega), float(theta), float(rho)
 
     def simulate_price_paths(
         self,
