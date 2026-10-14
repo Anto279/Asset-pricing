@@ -27,13 +27,17 @@ class Bonds:
         T = self.maturity
         N = self.nominal
 
-        # Pricing flux actualisés (Ta logique)
-        # Note : Si T est float (ex: 0.5 an), la boucle range(1, int(0.5)) ne s'exécute pas.
-        # C'est correct pour un Zéro-Coupon (pas de flux intermédiaires).
+        # Pricing flux actualisés
+        # Coupons annuels, datés à rebours depuis la maturité : T, T-1, T-2, ... (> 0)
+        # - T entier (ex: 5)   -> coupons en 1, 2, 3, 4, 5
+        # - T non entier (5.5) -> coupons en 0.5, 1.5, ..., 5.5
+        # Le dernier coupon est versé avec le nominal en T : il ne doit être compté qu'une fois.
         price = 0
-        for t in range(1, int(T) + 1): # +1 pour inclure l'année T si T est entier
-             price += c / (1+r)**t
-             
+        t = T - 1
+        while t > 1e-9:
+            price += c / (1+r)**t
+            t -= 1
+
         # Flux final (Nominal + dernier coupon) actualisé à la date exacte T
         # Si Zéro-coupon (c=0), cela revient à N / (1+r)^T
         price += (c + N) / (1+r)**T

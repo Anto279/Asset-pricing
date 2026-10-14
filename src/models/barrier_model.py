@@ -272,72 +272,79 @@ class BarrierPricingModel:
     # =================================================================
     def price_barrier_analytic(self, option: BarrierOption):
         """
-        Implémente les formules fermées de Reiner-Rubinstein (1991).
-        Utilise les variables phi (Call/Put) et eta (Down/Up).
+        Implémente les formules fermées de Reiner-Rubinstein (1991),
+        dans la présentation de Haug (The Complete Guide to Option Pricing Formulas).
+
+        Le prix s'écrit comme une combinaison de 4 briques A, B, C, D :
+          - A : option vanille (Black-Scholes)
+          - B : vanille "coupée" au niveau de la barrière (terme en ln(S/H))
+          - C : option "reflet" (principe de réflexion, terme en ln(H^2 / (S*K)))
+          - D : reflet "coupé" au niveau de la barrière (terme en ln(H/S))
+        La combinaison dépend du type (call/put), de la direction (down/up),
+        du mécanisme (in/out) et de la position du strike par rapport à la barrière.
+        Rebate = 0. Dividende continu q pris en compte s'il est renseigné.
         """
-        S = option.spot
-        K = option.parameters.get_strike()
-        r = option.parameters.get_risk_free_rate()
-        sigma = option.parameters.get_volatility()
-        T = option.parameters.get_maturity()
-        B = option.barrier # H
-        
-        # 1. Configuration des variables binaires
-        # phi : 1 pour Call, -1 pour Put
-        phi = 1 if option.option_type == "call" else -1
-        
-        # eta : 1 pour Down, -1 pour Up (Attention à la convention)
-        # Standard : Down means S > H (on descend vers H). Up means S < H.
-        eta = 1 if "down" in option.barrier_type else -1
-        
-        # 2. Paramètres intermédiaires
-        mu = (r - 0.5 * sigma**2) / sigma**2
-        lam = np.sqrt(mu**2 + 2 * r / sigma**2) # Souvent mu + 1 si r constant
-        
-        # Facteurs d'actualisation et volatilité
-        df = np.exp(-r * T)
+        S = float(option.spot)
+        K = float(option.parameters.get_strike())
+        r = float(option.parameters.get_risk_free_rate())
+        sigma = float(option.parameters.get_volatility())
+        T = float(option.parameters.get_maturity())
+        H = float(option.barrier)
+        q = option.parameters.get_dividend() if hasattr(option.parameters, "get_dividend") else 0.0
+        b = r - q  # cost of carry
+
+        is_call = option.option_type == "call"
+        is_down = "down" in option.barrier_type
+        is_out = "out" in option.barrier_type
+
+        # Barrière déjà franchie au départ : l'option Out est morte, l'option In est une vanille
+        already_hit = (is_down and S <= H) or ((not is_down) and S >= H)
+
+        # 1. Paramètres intermédiaires
+        mu = (b - 0.5 * sigma**2) / sigma**2
         vol_sqrt_T = sigma * np.sqrt(T)
-        
-        # 3. Calcul des distances standardisées (x1, x2) et reflétées (y1, y2)
-        # x1, x2 : Comme dans Black-Scholes standard
-        x1 = (np.log(S / K) / vol_sqrt_T) + (1 + mu) * vol_sqrt_T
-        x2 = x1 - vol_sqrt_T
-        
-        # y1, y2 : Reflétés par rapport à la barrière
-        # Terme log(H^2 / (S*K))
-        y1 = (np.log(B**2 / (S * K)) / vol_sqrt_T) + (1 + mu) * vol_sqrt_T
-        y2 = y1 - vol_sqrt_T
-        
-        # 4. Calcul des "Briques" de prix
-        
-        # A. Prix Vanille Standard (V_vanilla)
-        # Formule : phi * S * N(phi*x1) - phi * K * df * N(phi*x2)
-        V_vanilla = phi * S * norm.cdf(phi * x1) - phi * K * df * norm.cdf(phi * x2)
-        
-        # B. Prix Reflété (V_reflet) (Rebate ou Image)
-        # Formule : A * [phi * S * (H/S)^(2(mu+1)) * N(eta*y1) ... ]
-        # Attention, ici eta joue un rôle dans la direction de l'intégration N()
-        # Dans la formule standard RR pour les cas réguliers (K du bon côté) :
-        # Down (eta=1) -> N(y). Up (eta=-1) -> N(-y). Donc N(eta * y).
-        
-        term_S = (B / S)**(2 * (mu + 1))
-        term_K = (B / S)**(2 * mu)
-        
-        # Note : Pour les cas standards, on utilise eta.
-        # Pour le reflet, on applique eta à y1 et y2
-        V_reflet = phi * S * term_S * norm.cdf(eta * y1) - phi * K * df * term_K * norm.cdf(eta * y2)
-        
-        # 5. Assemblage final selon le type (In ou Out)
-        
-        # Cas "OUT" (Knock-Out)
-        if "out" in option.barrier_type:
-            # Prix = Vanille - Reflet
-            # Cela fonctionne pour les cas standards (K > B pour Call Down, etc.)
-            return max(0, V_vanilla - V_reflet)
-            
-        # Cas "IN" (Knock-In)
-        elif "in" in option.barrier_type:
-            # Prix = Reflet
-            return max(0, V_reflet)
-            
-        return 0.0
+        df_r = np.exp(-r * T)        # actualisation du strike
+        df_q = np.exp((b - r) * T)   # = exp(-qT), appliqué au spot
+
+        # 2. Distances standardisées
+        x1 = np.log(S / K) / vol_sqrt_T + (1 + mu) * vol_sqrt_T
+        x2 = np.log(S / H) / vol_sqrt_T + (1 + mu) * vol_sqrt_T
+        y1 = np.log(H**2 / (S * K)) / vol_sqrt_T + (1 + mu) * vol_sqrt_T
+        y2 = np.log(H / S) / vol_sqrt_T + (1 + mu) * vol_sqrt_T
+
+        # 3. Les 4 briques (phi = +1 call / -1 put, eta = +1 down / -1 up)
+        def A(phi):
+            return phi * S * df_q * norm.cdf(phi * x1) - phi * K * df_r * norm.cdf(phi * x1 - phi * vol_sqrt_T)
+
+        def B(phi):
+            return phi * S * df_q * norm.cdf(phi * x2) - phi * K * df_r * norm.cdf(phi * x2 - phi * vol_sqrt_T)
+
+        def C(phi, eta):
+            return (phi * S * df_q * (H / S)**(2 * (mu + 1)) * norm.cdf(eta * y1)
+                    - phi * K * df_r * (H / S)**(2 * mu) * norm.cdf(eta * y1 - eta * vol_sqrt_T))
+
+        def D(phi, eta):
+            return (phi * S * df_q * (H / S)**(2 * (mu + 1)) * norm.cdf(eta * y2)
+                    - phi * K * df_r * (H / S)**(2 * mu) * norm.cdf(eta * y2 - eta * vol_sqrt_T))
+
+        phi = 1 if is_call else -1
+        vanilla = A(phi)
+
+        if already_hit:
+            return 0.0 if is_out else max(0.0, float(vanilla))
+
+        # 4. Prix des options "In" (Haug, rebate nul)
+        if is_call and is_down:
+            price_in = C(1, 1) if K > H else A(1) - B(1) + D(1, 1)
+        elif is_call and not is_down:
+            price_in = A(1) if K > H else B(1) - C(1, -1) + D(1, -1)
+        elif (not is_call) and is_down:
+            price_in = B(-1) - C(-1, 1) + D(-1, 1) if K > H else A(-1)
+        else:
+            price_in = A(-1) - B(-1) + D(-1, -1) if K > H else C(-1, -1)
+
+        # 5. Parité In + Out = Vanille
+        price = vanilla - price_in if is_out else price_in
+
+        # max(0, .) uniquement pour absorber les erreurs d'arrondi (~1e-15)
+        return max(0.0, float(price))

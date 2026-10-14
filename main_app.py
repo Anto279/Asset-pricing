@@ -1346,7 +1346,7 @@ def page_pricer():
                     # Formule clé : variance intégrée
                     st.latex(r"\int_0^T v_t\,dt")
 
-                    st.markdown("""
+                    st.markdown(r"""
                     Conséquences pratiques :
                     - Même en prenant $$v_0=\sigma^2$$ et $$\theta=\sigma^2$$, tu peux avoir un prix différent si la variance est aléatoire (vol-of-vol).
                     - La corrélation change la forme de la distribution (skew) : avec $$\rho<0$$, les calls ATM peuvent être **moins chers** que BS à vol “moyenne” égale.
@@ -1901,7 +1901,7 @@ def page_pricer():
                 
                 st.latex(r"P(\text{Hit}) = \exp\left( -\frac{2 \ln(S_t/B) \cdot \ln(S_{t+1}/B)}{\sigma^2 \Delta t} \right)")
                 
-                st.markdown("""
+                st.markdown(r"""
                 ### 3. Algorithme de Simulation Avancé
                 Pour chaque pas de temps de chaque trajectoire :
                 1.  **Vérification Discrète :** Est-ce que $S_{t+1}$ a franchi la barrière ?
@@ -1911,33 +1911,43 @@ def page_pricer():
 
         elif pricing_method == "Formule Fermée (Merton / Reiner-Rubinstein)":
             with st.expander("📘 Cours : Les Formules Analytiques (Reiner-Rubinstein)", expanded=True):
-                st.markdown("""
+                st.markdown(r"""
                 ### 1. Le Principe de Réflexion (Mirror Principle)
-                Le modèle analytique repose sur l'idée géométrique que pour toute trajectoire touchant une barrière $H$, il existe une trajectoire "miroir" symétrique.
-                Le prix d'une option barrière se construit donc comme une combinaison linéaire d'une **Option Vanille** et d'une **Option Reflet**.
-                
-                ### 2. Les Formules (Cas Standards)
-                On définit deux briques de base :
-                * **$V_{std}$ (Prix Vanille)** : Le prix Black-Scholes classique.
-                * **$V_{ref}$ (Prix Reflet)** : Le prix d'une option fictive "miroir".
+                Le modèle analytique repose sur l'idée géométrique que pour toute trajectoire touchant une barrière $H$, il existe une trajectoire "miroir" symétrique par rapport à $H$.
+                Le prix d'une option barrière s'écrit donc comme une **combinaison de quatre briques** (notations de Haug), avec $\phi = +1$ pour un Call, $-1$ pour un Put, et $\eta = +1$ pour une barrière Down, $-1$ pour une barrière Up :
+                * **$A$** : l'option vanille (Black-Scholes classique) ;
+                * **$B$** : la vanille "coupée" au niveau de la barrière ;
+                * **$C$** : l'option **reflet** (trajectoires miroir, terme en $\ln(H^2/SK)$) ;
+                * **$D$** : le reflet "coupé" au niveau de la barrière.
                 """)
-                
-                st.latex(r"V_{ref} = \phi S \left(\frac{H}{S}\right)^{2(\mu+1)} \mathcal{N}(\eta y_1) - \phi K e^{-rT} \left(\frac{H}{S}\right)^{2\mu} \mathcal{N}(\eta y_2)")
-                
-                st.markdown("""
-                Où $\mu = (r - \sigma^2/2)/\sigma^2$ et $y_1, y_2$ sont les distances standardisées reflétées (termes en $\ln(H^2/SK)$).
-                
-                **La Logique LEGO :**
-                * Pour une Option **Knock-Out** (Désactivante) :
+
+                st.latex(r"C = \phi S e^{-qT} \left(\frac{H}{S}\right)^{2(\mu+1)} \mathcal{N}(\eta y_1) - \phi K e^{-rT} \left(\frac{H}{S}\right)^{2\mu} \mathcal{N}(\eta y_1 - \eta\sigma\sqrt{T})")
+
+                st.markdown(r"""
+                Où $\mu = (r - q - \sigma^2/2)/\sigma^2$ et $y_1 = \dfrac{\ln(H^2/SK)}{\sigma\sqrt{T}} + (1+\mu)\sigma\sqrt{T}$.
+
+                ### 2. Quelle combinaison ? Cela dépend de la position du strike
+                Prix des options **Knock-In** (activantes) :
                 """)
-                st.latex(r"\text{Prix} = V_{std} - V_{ref}")
-                st.markdown("*On prend tout, et on enlève ce qui touche la barrière.*")
-                
-                st.markdown("""
-                * Pour une Option **Knock-In** (Activante) :
+
+                st.markdown(r"""
+                | Option | $K > H$ | $K \le H$ |
+                |---|---|---|
+                | Down-and-In Call | $C$ | $A - B + D$ |
+                | Up-and-In Call | $A$ | $B - C + D$ |
+                | Down-and-In Put | $B - C + D$ | $A$ |
+                | Up-and-In Put | $A - B + D$ | $C$ |
                 """)
-                st.latex(r"\text{Prix} = V_{ref}")
-                st.markdown("*Le prix est exactement la valeur des trajectoires qui touchent.*")
+
+                st.markdown(r"""
+                Le cas "simple" $V_{In} = C$ (le reflet) n'est vrai que pour le **Down-and-In Call avec $K > H$** et l'**Up-and-In Put avec $K \le H$**.
+                Dès que le strike est "du mauvais côté" de la barrière, il faut corriger avec $B$ et $D$.
+
+                ### 3. La parité In / Out
+                Une option Out se déduit de l'option In : à chaque trajectoire, exactement une des deux est vivante à maturité.
+                """)
+                st.latex(r"V_{Out} = V_{Vanille} - V_{In}")
+                st.markdown(r"*Exemple : un Up-and-Out Call avec $K < H$ vaut beaucoup moins que la vanille, car les trajectoires qui finissent très dans la monnaie ont presque toutes touché la barrière.*")
 
         st.divider()
         # --- EXEMPLES SIMPLES : BARRIÈRES ---
